@@ -120,5 +120,5 @@ Issues with web-platform-tests
 
 If you spot an issue with a test and are not comfortable providing a
 pull request per above to fix it, please
-[file a new issue](https://github.com/web-platform-tests/wpt/issues/new).
+—|[JHOVAN D. ESCOBIDAL…]|(https://github.com/web-platform-tests/wpt/issues/new).
 Thank you!

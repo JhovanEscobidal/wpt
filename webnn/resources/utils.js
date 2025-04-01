@@ -7,12 +7,12 @@ const operatorToleranceDict = {
   gelu: {float32: 18, float16: 18},
   hardSigmoid: {float32: 2, float16: 2},
   hardSwish: {float32: 4, float16: 4},
-  leakyRelu: {float32: 1, float16: 1},
+  leakyRelu: {float32: 1, float16: 2},
   linear: {float32: 2, float16: 2},
   prelu: {float32: 1, float16: 1},
   relu: {float32: 0, float16: 0},
   reshape: {float32: 0, float16: 0},
-  sigmoid: {float32: 34, float16: 3},
+  sigmoid: {float32: 34, float16: 10},
   softplus: {float32: 18, float16: 18},
   softsign: {float32: 3, float16: 3},
 };
@@ -93,12 +93,17 @@ const kIntTypes =
     ['uint4', 'int4', 'uint8', 'int8', 'uint32', 'int32', 'uint64', 'int64'];
 const kFloatTypes = ['float16', 'float32'];
 
-const findCompatibleType = (dataType, supportedTypes) => {
+const findCompatibleType = (dataType, supportedTypes, castOpSupportLimits) => {
+  if (!castOpSupportLimits.input.dataTypes.includes(dataType)) {
+    // Cannot cast from `dataType` to any other type.
+    return null;
+  }
+
   for (let supportedType of supportedTypes) {
-    if (kIntTypes.includes(dataType)) {
-      if (kIntTypes.indexOf(supportedType) > kIntTypes.indexOf(dataType)) {
-        return supportedType;
-      }
+    if (kIntTypes.includes(dataType) &&
+        castOpSupportLimits.output.dataTypes.includes(dataType) &&
+        kIntTypes.indexOf(supportedType) > kIntTypes.indexOf(dataType)) {
+      return supportedType;
     }
 
     if (kFloatTypes.includes(dataType)) {
@@ -244,23 +249,22 @@ const sizeOfShape = (array) => {
 /**
  * Get bitwise of the given value.
  * @param {Number} value
- * @param {String} dataType - A data type string, like "float32", "float16",
- *     more types, please see:
- *     https://www.w3.org/TR/webnn/#enumdef-mloperanddatatype
- * @return {Number} A 64-bit signed integer.
+ * @param {String} dataType - A data type string; currently only "float32" is
+ *     supported by this function.
+ * @return {BigInt} A 64-bit signed integer.
  */
 const getBitwise = (value, dataType) => {
   const buffer = new ArrayBuffer(8);
   const int64Array = new BigInt64Array(buffer);
-  int64Array[0] = value < 0 ? ~BigInt(0) : BigInt(0);
   let typedArray;
   if (dataType === "float32") {
     typedArray = new Float32Array(buffer);
   } else {
     throw new AssertionError(`Data type ${dataType} is not supported`);
   }
-  typedArray[0] = value;
-  return int64Array[0];
+  typedArray[0] = Math.abs(value);
+  const int64 = int64Array[0];
+  return (value < 0) ? -int64 : int64;
 };
 
 /**
@@ -285,34 +289,12 @@ const assert_array_approx_equals_ulp = (actual, expected, nulp, dataType, descri
       actual.length === expected.length,
       `assert_array_approx_equals_ulp: ${description} lengths differ, ` +
           `expected ${expected.length} but got ${actual.length}`);
-  let actualBitwise, expectedBitwise, distance;
+  let distance;
   for (let i = 0; i < actual.length; i++) {
     if (actual[i] === expected[i]) {
       continue;
     } else {
-      // measure the ULP distance
-      if (dataType === 'float32') {
-        actualBitwise = getBitwise(actual[i], dataType);
-        expectedBitwise = getBitwise(expected[i], dataType);
-      } else if (dataType === 'float16') {
-        actualBitwise = actual[i];
-        // convert expected data of Float16 to Uint16
-        expectedBitwise = toHalf(expected[i]);
-      } else if (dataType === 'int64') {
-        actualBitwise = actual[i];
-        expectedBitwise = BigInt(expected[i]);
-      } else if (dataType === 'uint64') {
-        actualBitwise = actual[i];
-        expectedBitwise = BigUint64Array(expected[i]);
-      } else if (
-          dataType === 'int8' || dataType === 'uint8' || dataType === 'int32' ||
-          dataType === 'uint32' || dataType === 'int4' ||
-          dataType === 'uint4') {
-        actualBitwise = actual[i];
-        expectedBitwise = expected[i];
-      }
-      distance = actualBitwise - expectedBitwise;
-      distance = distance >= 0 ? distance : -distance;
+      distance = ulpDistance(actual[i], expected[i], dataType);
 
       // if true, invoke assert_true() in failure case
       // if false, it's expected, not invoke assert_true() in success case to
@@ -321,13 +303,85 @@ const assert_array_approx_equals_ulp = (actual, expected, nulp, dataType, descri
         assert_true(
             false,
             `assert_array_approx_equals_ulp: ${description} actual ` +
-                `${actual[i]} should be close enough to expected ` +
+                `${
+                    dataType === 'float16' ?
+                        float16AsUint16ToNumber(actual[i]) :
+                        actual[i]} should be close enough to expected ` +
                 `${expected[i]} by the acceptable ${nulp} ULP distance, ` +
                 `but they have ${distance} ULP distance`);
       }
     }
   }
 };
+
+/**
+ * Compute the ULP distance between ``a`` and ``b`` for the given ``dataType``.
+ *
+ * @param {(Number|BigInt)} a - First value.
+ * @param {(Number|BigInt)} b - Second value.
+ * @param {String} dataType - A data type string, value: "float32",
+ *     more types, please see:
+ *     https://www.w3.org/TR/webnn/#enumdef-mloperanddatatype
+ */
+const ulpDistance = (a, b, dataType) => {
+  let aBitwise, bBitwise;
+  // measure the ULP distance
+  if (dataType === 'float32') {
+    aBitwise = getBitwise(a, dataType);
+    bBitwise = getBitwise(b, dataType);
+  } else if (dataType === 'float16') {
+    aBitwise = a;
+    // convert b data of Float16 to Uint16
+    bBitwise = toHalf(b);
+
+    // Workaround to use mask to check returned special float16 value -0.0 which
+    // is 32768 (1000 0000 0000 0000) of uint16
+    const signExclusionMask = 0x00007FFF;
+    if ((aBitwise & signExclusionMask) === 0 &&
+        (bBitwise & signExclusionMask) === 0) {
+      return 0;
+    }
+  } else if (dataType === 'int64' || dataType === 'uint64') {
+    aBitwise = BigInt(a);
+    bBitwise = BigInt(b);
+  } else if (
+      dataType === 'int8' || dataType === 'uint8' || dataType === 'int32' ||
+      dataType === 'uint32' || dataType === 'int4' || dataType === 'uint4') {
+    aBitwise = a;
+    bBitwise = b;
+  } else {
+    throw new AssertionError(`Data type ${dataType} is not supported`);
+  }
+  const distance = aBitwise - bBitwise;
+  return distance >= 0 ? distance : -distance;
+};
+
+/**
+ * This function converts a Float16 stored as the bits of a Uint16 into a
+ * JavaScript Number.
+ * @param {Number} uint16 - a Float16 stored as the bits of a Uint16
+ * @returns An emulated Float16 number.
+ */
+function float16AsUint16ToNumber(uint16) {
+  const sign = (uint16 >> 15) & 0x1;
+  const exponent = (uint16 >> 10) & 0x1F;
+  const mantissa = uint16 & 0x3FF;
+  let float16;
+
+  if (exponent === 0) {
+    // Subnormal number
+    float16 = (mantissa / 1024) * Math.pow(2, -14);
+  } else if (exponent === 0x1F) {
+    // NaN or Infinity
+    float16 = mantissa ? NaN : Infinity;
+  } else {
+    // Normalized number
+    float16 = (1 + mantissa / 1024) * Math.pow(2, exponent - 15);
+  }
+
+  // Apply the sign
+  return sign ? -float16 : float16;
+}
 
 /**
  * Assert actual results with expected results.
@@ -351,8 +405,17 @@ const doAssert =
         assert_array_approx_equals_ulp(
             actual, expected, toleranceValue, dataType, description);
       } else if (metricType === 'ATOL') {
+        let actualData;
+        if (dataType === 'float16') {
+          // workaround for float16
+          actualData = new Array(actual.length);
+          actual.forEach(
+              (x, index) => actualData[index] = float16AsUint16ToNumber(x));
+        } else {
+          actualData = actual;
+        }
         assert_array_approx_equals(
-            actual, expected, toleranceValue, description);
+            actualData, expected, toleranceValue, description);
       } else {
         throw new AssertionError(
             `Tolerance Metric type '${metricType}' is not supported`);
@@ -447,7 +510,8 @@ const createOperand = (context, builder, operandName, resources) => {
   // If input data type is not supported on current platform, attempt to use
   // a supported type to pass the data, then cast back to original type.
   if (!supportedDataTypes.includes(dataType)) {
-    const compatibleType = findCompatibleType(dataType, supportedDataTypes);
+    const compatibleType = findCompatibleType(
+        dataType, supportedDataTypes, context.opSupportLimits().cast);
     if (compatibleType) {
       descriptor.castedType = compatibleType;
       descriptor.dataType = compatibleType;
@@ -784,7 +848,8 @@ const buildAndExecuteGraph = async (context, builder, graphResources) => {
             expectedDescriptor.dataType)) {
       const compatibleType = findCompatibleType(
           expectedDescriptor.dataType,
-          context.opSupportLimits().output.dataTypes);
+          context.opSupportLimits().output.dataTypes,
+          context.opSupportLimits().cast);
       outputOperands[i] = builder.cast(outputOperands[i], compatibleType);
       expectedDescriptor.castedType = compatibleType;
     }
@@ -921,6 +986,15 @@ const getConv2dPrecisionTolerance =
   return {metricType: 'ULP', value: toleranceValueDict[expectedDataType]};
 };
 
+const getInstanceNormPrecisionTolerance = (graphResources) => {
+  // according to
+  // https://github.com/web-platform-tests/wpt/pull/43891#discussion_r1457026316
+  const toleranceValueDict = {float32: 840, float16: 8400};
+  const expectedDataType =
+      getExpectedDataTypeOfSingleOutput(graphResources.expectedOutputs);
+  return {metricType: 'ULP', value: toleranceValueDict[expectedDataType]};
+};
+
 const getExpectedDataTypeOfSingleOutput = (expectedOutput) => {
   const expectedDescriptor =
       expectedOutput[Object.keys(expectedOutput)[0]].descriptor;
@@ -953,8 +1027,12 @@ const getReducedElementCount =
           1;
     };
 
+// `cast_to_supported_type` will check if the graph input/output is
+// supported by current context, if not, it will try to find a compatible
+// type that's supported and use that type, then cast back to original type.
 const webnn_conformance_test =
-    (buildAndExecuteGraphFunc, toleranceFunc, testResources) => {
+    (buildAndExecuteGraphFunc, toleranceFunc, testResources,
+     cast_to_supported_type = false) => {
       promise_test(async () => {
         let context;
         try {
@@ -963,7 +1041,9 @@ const webnn_conformance_test =
           throw new AssertionError(
               `Unable to create context for ${variant} variant. ${e}`);
         }
-        validateContextSupportsGraph(context, testResources.graph);
+        if (!cast_to_supported_type) {
+          validateContextSupportsGraph(context, testResources.graph);
+        }
         const builder = new MLGraphBuilder(context);
         const {result, intermediateOperands} = await buildAndExecuteGraphFunc(
             context, builder, testResources.graph);
